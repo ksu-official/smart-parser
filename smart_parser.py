@@ -4,7 +4,7 @@ import re
 import qrcode
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 from rapidfuzz import fuzz
 
 # === CONFIGURATION (PLACEHOLDERS FOR GITHUB) ===
@@ -12,18 +12,17 @@ API_ID = 123456
 API_HASH = "your_api_hash_here"
 
 SOURCES = [
-    "rootdatalabs",
-    "CryptorankFundraisingSniper",
-    "ico_analytic",
-    "crypto_fundraising",
-    "just_ksu0000"
+    "_______",
+    "_______________",
+    "___________________",
+    "________________________",
+    "_____________________________"
 ]
 
 TARGET_CHAT_ID = 0        # replace with your real chat ID on server
 TOPIC_ID = 0              # replace with your real topic ID on server
 
 client = TelegramClient("session_name", API_ID, API_HASH)
-translator = Translator()
 
 # === DATABASE ===
 db = sqlite3.connect("buffer.db")
@@ -45,9 +44,10 @@ async def publish_event(project_name):
 
         # Translation EN → RU
         translated_facts = []
+        translator = GoogleTranslator(source='auto', target='ru')
         for fact in unique_facts:
             try:
-                translated = translator.translate(fact, src="en", dest="ru").text
+                translated = translator.translate(fact)
                 translated_facts.append(translated)
             except:
                 translated_facts.append(fact)
