@@ -17,24 +17,24 @@ from dotenv import load_dotenv
 # === CONFIG ===
 load_dotenv()
 
-# Replace these with your real values in .env or directly here
-API_ID    = int(os.getenv("API_ID",    "YOUR_API_ID_HERE"))
-API_HASH  =     os.getenv("API_HASH",  "YOUR_API_HASH_HERE")
-DEEPL_KEY =     os.getenv("DEEPL_KEY", "YOUR_DEEPL_API_KEY_HERE")
+API_ID    = os.getenv("API_ID")
+API_HASH  = os.getenv("API_HASH")
+DEEPL_KEY = os.getenv("DEEPL_KEY")
 
-TARGET_CHAT_ID = -1000000000000   # Replace with your target chat ID
-TARGET_TOPIC_ID = 123456          # Replace with your topic/thread ID
-MEMORY_DAYS = 7                   # How many days to keep project history
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID")
+TOPIC_ID       = os.getenv("TOPIC_ID")
+MEMORY_DAYS    = int(os.getenv("MEMORY_DAYS", "7"))
 
-SOURCE_CHANNELS = [
-    "-----------------",
-    "---------------",
-    "-------------",
-    "-----------",
-    "--------",
-]
+SOURCES = os.getenv("SOURCES", "").split(",")
 
-client = TelegramClient("aggregator_session", API_ID, API_HASH)
+if not API_ID or not API_HASH:
+    raise RuntimeError("❌ Missing API_ID or API_HASH in .env")
+
+API_ID = int(API_ID)
+TARGET_CHAT_ID = int(TARGET_CHAT_ID) if TARGET_CHAT_ID else None
+TOPIC_ID = int(TOPIC_ID) if TOPIC_ID else None
+
+client           = TelegramClient("session_name", API_ID, API_HASH)
 translator_deepl = deepl.Translator(DEEPL_KEY)
 
 # === DATABASE ===
@@ -58,10 +58,8 @@ lock = asyncio.Lock()
 # === HELPERS ===
 
 def extract_project_name(text: str) -> str:
-    """Extract a clean project name from raw text."""
     garbage_words = {"NEW", "THE", "A", "AN", "THIS", "JUST", "MOST"}
 
-    # Pattern: [Something] ProjectName ...
     m = re.match(r"
 
 \[.*?\]
@@ -72,14 +70,12 @@ def extract_project_name(text: str) -> str:
         if candidate not in garbage_words:
             return candidate
 
-    # Pattern: ProjectName:
     m = re.match(r"([A-Za-z0-9\-]{2,30})\s*[:\-]", text)
     if m:
         candidate = m.group(1).upper()
         if candidate not in garbage_words:
             return candidate
 
-    # Pattern: [ProjectName]
     m = re.search(r"
 
 \[([A-Za-z0-9\-\s]{2,40})\]
@@ -87,26 +83,22 @@ def extract_project_name(text: str) -> str:
 ", text)
     if m:
         name = m.group(1).strip().upper()
-        garbage_phrases = {"----", "-----", "-----", "-----", "-----", "-------"}
+        garbage_phrases = {"NEW", "INVESTMENT", "ALERT", "FUNDRAISING", "ROOTDATA", "MOST POPULAR"}
         if not any(g in name for g in garbage_phrases):
             return name
 
-    # Fallback: first word
-    first = text.split()[0].strip(",.:!#[]()").upper()
-    if 2 <= len(first) <= 20 and first.isalnum() and first not in garbage_words:
+    first = re.sub(r'[^A-Za-z0-9]', '', text.split()[0]).upper()
+    if 2 <= len(first) <= 20 and first not in garbage_words:
         return first
 
     return "UNKNOWN"
 
 
 def protect_and_translate(text: str) -> str:
-    """Translate text using DeepL while protecting project names."""
-    ignore = {"---", "---", "---", "---", "---", "---", "---", "---", "--", "--"}
-
+    ignore = {"THE", "THIS", "MOST", "NEW", "AND", "FROM", "WITH", "FOR", "IN", "ON"}
     names = sorted(
         [n for n in set(re.findall(r'\b[A-Z][A-Za-z0-9]{2,}\b', text)) if n not in ignore],
-        key=len,
-        reverse=True,
+        key=len, reverse=True,
     )
 
     placeholders = {}
@@ -115,12 +107,11 @@ def protect_and_translate(text: str) -> str:
     for i, name in enumerate(names):
         key = f"__PH_{i}__"
         placeholders[key] = name
-        temp = temp.replace(name, key)
+        temp = re.sub(rf'\b{re.escape(name)}\b', key, temp)
 
     try:
         translated = translator_deepl.translate_text(temp, target_lang="RU").text
-    except Exception as e:
-        print(f"⚠️ DeepL error: {e}, fallback → Google Translate")
+    except Exception:
         translated = GoogleTranslator(source="auto", target="ru").translate(temp)
 
     for key, name in placeholders.items():
@@ -130,12 +121,11 @@ def protect_and_translate(text: str) -> str:
 
 
 def extract_twitter(text: str):
-    m = re.search(r'(https?://(?:x\.com|twitter\.com)/\S+)', text)
+    m = re.search(r'(https?://(?:x\.com|twitter\.com|t\.co|mobile\.twitter\.com)/\S+)', text)
     return m.group(1) if m else None
 
 
 def format_single(project: str, en: str, ru: str) -> str:
-    """Format a single update."""
     tw = extract_twitter(en)
     tw_line = f"\n\n🔗 [Twitter]({tw})" if tw else ""
     return (
@@ -147,26 +137,48 @@ def format_single(project: str, en: str, ru: str) -> str:
 
 
 def format_updated(project: str, en_blocks: list, ru_blocks: list) -> str:
-    """Format a multi-update post."""
     tw = extract_twitter("\n".join(en_blocks))
     tw_line = f"\n\n🔗 [Twitter]({tw})" if tw else ""
 
-    parts = []
-    for i, (e, r) in enumerate(zip(en_blocks, ru_blocks), 1):
-        parts.append(
-            f"📌 **Update #{i}**\n"
-            f"🔤 {e.strip()}\n\n"
-            f"📝 {r.strip()}"
-        )
+    sources = []
+    clean_en_blocks = []
+    clean_ru_blocks = []
 
-    body = "\n\n─────────────\n\n".join(parts)
-    return f"🚀 **{project}**\n\n{body}{tw_line}"
+    for e, r in zip(en_blocks, ru_blocks):
+        src_lines = [line for line in e.splitlines() if line.strip().lower().startswith("source:")]
+        sources.extend(src_lines)
+
+        body_en = "\n".join(l for l in e.splitlines() if not l.strip().lower().startswith("source:")).strip()
+        body_ru = "\n".join(l for l in r.splitlines() if not l.strip().lower().startswith("source:")).strip()
+
+        clean_en_blocks.append(body_en)
+        clean_ru_blocks.append(body_ru)
+
+    combined_en = "\n\n---\n\n".join(clean_en_blocks)
+    combined_ru = "\n\n---\n\n".join(clean_ru_blocks)
+
+    seen = set()
+    unique_sources = []
+    for s in sources:
+        if s not in seen:
+            seen.add(s)
+            unique_sources.append(s)
+
+    sources_block = ("\n\n📎 **Sources:**\n" + "\n".join(unique_sources)) if unique_sources else ""
+
+    return (
+        f"🚀 **{project}**\n\n"
+        f"🔤 **EN:**\n{combined_en}\n\n"
+        f"📝 **RU:**\n{combined_ru}"
+        f"{sources_block}"
+        f"{tw_line}"
+    )
 
 
 # === MAIN HANDLER ===
 
-@client.on(events.NewMessage(chats=SOURCE_CHANNELS))
-async def handler(event) -> None:
+@client.on(events.NewMessage(chats=SOURCES))
+async def handler(event):
     if not event.message.text:
         return
 
@@ -177,7 +189,6 @@ async def handler(event) -> None:
     if len(cleaned_en) < 5:
         return
 
-    print(f"📥 [{project}] New message received")
     translated_ru = protect_and_translate(cleaned_en)
 
     async with lock:
@@ -192,16 +203,17 @@ async def handler(event) -> None:
             old_en, old_ru, msg_id = row
 
             if fuzz.token_set_ratio(cleaned_en, old_en) > 93:
-                print(f"🚫 Duplicate for {project}, skipping")
                 return
 
             old_en_blocks = old_en.split("\n\n---\n\n")
             old_ru_blocks = old_ru.split("\n\n---\n\n")
+
             new_en_blocks = old_en_blocks + [cleaned_en]
             new_ru_blocks = old_ru_blocks + [translated_ru]
 
             new_en = "\n\n---\n\n".join(new_en_blocks)
             new_ru = "\n\n---\n\n".join(new_ru_blocks)
+
             full = format_updated(project, new_en_blocks, new_ru_blocks)
 
             try:
@@ -211,12 +223,10 @@ async def handler(event) -> None:
                     (new_en, new_ru, msg_id),
                 )
                 db.commit()
-                print(f"🔄 Updated post: {project} ({len(new_en_blocks)} updates)")
 
-            except (MessageNotModifiedError, MessageIdInvalidError) as e:
-                print(f"⚠️ edit_message failed ({e}), sending new post")
+            except (MessageNotModifiedError, MessageIdInvalidError):
                 sent = await client.send_message(
-                    TARGET_CHAT_ID, full, reply_to=TARGET_TOPIC_ID, link_preview=False
+                    TARGET_CHAT_ID, full, reply_to=TOPIC_ID, link_preview=False
                 )
                 db.execute(
                     "UPDATE buffer SET msg_id=?, info_en=?, info_ru=?, timestamp=CURRENT_TIMESTAMP WHERE project=?",
@@ -227,19 +237,18 @@ async def handler(event) -> None:
         else:
             full = format_single(project, cleaned_en, translated_ru)
             sent = await client.send_message(
-                TARGET_CHAT_ID, full, reply_to=TARGET_TOPIC_ID, link_preview=False
+                TARGET_CHAT_ID, full, reply_to=TOPIC_ID, link_preview=False
             )
             db.execute(
                 "INSERT OR REPLACE INTO buffer (project, info_en, info_ru, msg_id) VALUES (?, ?, ?, ?)",
                 (project, cleaned_en, translated_ru, sent.id),
             )
             db.commit()
-            print(f"🆕 New project: {project}")
 
 
 # === AUTO CLEAN DB ===
 
-async def auto_clean_db() -> None:
+async def auto_clean_db():
     while True:
         await asyncio.sleep(3600)
         try:
@@ -247,59 +256,55 @@ async def auto_clean_db() -> None:
                 "DELETE FROM buffer WHERE timestamp < datetime('now', ?)",
                 (f"-{MEMORY_DAYS} days",),
             )
+            db.execute("VACUUM")
             db.commit()
-            print("🧹 Database cleaned")
-        except Exception as e:
-            print(f"⚠️ DB cleanup error: {e}")
+        except Exception:
+            pass
 
 
 # === QR LOGIN ===
 
-async def sign_in_with_qr() -> None:
+async def sign_in_with_qr():
     qr_login = await client.qr_login()
     last = None
 
-    while not qr_login.is_logged_in():
+    while True:
         if qr_login.url != last:
             qr = qrcode.QRCode()
             qr.add_data(qr_login.url)
             qr.print_ascii(invert=True)
-            print("\nScan this QR in Telegram → Devices → Link Desktop")
             last = qr_login.url
         try:
             await qr_login.wait(timeout=15)
             break
         except asyncio.TimeoutError:
             qr_login = await client.qr_login()
+        except SessionPasswordNeededError:
+            raise
+        except Exception:
+            break
 
 
 # === MAIN ===
 
-async def main() -> None:
+async def main():
     await client.connect()
 
     if not await client.is_user_authorized():
         try:
             await sign_in_with_qr()
         except SessionPasswordNeededError:
-            pw = input("Enter your 2FA password: ")
+            pw = input("Enter 2FA password: ")
             await client.sign_in(password=pw)
 
-    print(
-        f"\n🚀 BOT STARTED\n"
-        f"   • Each message = separate post\n"
-        f"   • Same project = post editing\n"
-        f"   • Duplicates ignored\n"
-        f"   • Memory: {MEMORY_DAYS} days\n"
-    )
     asyncio.create_task(auto_clean_db())
 
     try:
         await client.run_until_disconnected()
     finally:
         db.close()
-        print("🛑 Bot stopped, DB closed")
 
 
 if __name__ == "__main__":
     client.loop.run_until_complete(main())
+    
